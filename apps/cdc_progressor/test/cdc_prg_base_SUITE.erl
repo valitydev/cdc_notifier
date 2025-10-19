@@ -79,12 +79,12 @@ end_per_group(_, _) ->
 
 init_per_testcase(_, C) ->
     ok = cdc_prg_ct_helper:create_kafka_topics(),
-    timer:sleep(100),
+    timer:sleep(500),
     C.
 
 end_per_testcase(_, _) ->
     ok = cdc_prg_ct_helper:delete_kafka_topics(),
-    timer:sleep(100),
+    timer:sleep(500),
     ok.
 
 all() ->
