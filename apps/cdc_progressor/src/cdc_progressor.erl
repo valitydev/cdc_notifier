@@ -112,8 +112,7 @@ handle_call({handle_replication_data, ReplData}, _From, State) ->
     %% after reconnect_timeout wal will be reconnected and send will be retried
     {reply, Reply, State};
 handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+    {reply, ok, State}.
 
 -spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast({handle_replication_stop, _ReplSlot}, #{wal_reader := undefined} = State) ->
