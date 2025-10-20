@@ -141,9 +141,9 @@ handle_info({timeout, _TRef, restart_replication}, State) ->
         repl_slot := ReplSlot,
         publications := Publications
     } = State,
+    Options = #{slot_type => persistent},
     maybe
-        Options = #{slot_type => persistent},
-        {ok, Reader} = epg_wal_reader:subscribe({?MODULE, self()}, DbOpts, ReplSlot, Publications, Options),
+        {ok, Reader} ?= epg_wal_reader:subscribe({?MODULE, self()}, DbOpts, ReplSlot, Publications, Options),
         MonitorRef = erlang:monitor(process, Reader),
         NewState = State#{
             wal_reader => Reader,
