@@ -23,7 +23,8 @@
         }
     }},
     {resend_timeout, 100},
-    {max_retries, 1}
+    {max_retries, 1},
+    {reconnect_timeout, 1000}
 ]).
 -define(DEFAULT_CDC_CONF, [
     {streams, #{

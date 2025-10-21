@@ -22,6 +22,7 @@
 -export([simple_success_test/1]).
 -export([lifecycle_sink_test/1]).
 -export([db_connection_lost_test/1]).
+-export([sending_error_test/1]).
 
 -define(NS, 'namespace/subspace').
 
@@ -99,7 +100,8 @@ groups() ->
         {base, [], [
             simple_success_test,
             lifecycle_sink_test,
-            db_connection_lost_test
+            db_connection_lost_test,
+            sending_error_test
         ]}
     ].
 
@@ -257,6 +259,52 @@ db_connection_lost_test(_C) ->
         ]}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC),
     ok.
 
+-spec sending_error_test(_) -> _.
+sending_error_test(_C) ->
+    %% The test verifies that unsent messages are delivered after the kafka connection is restored
+    %% stop CDC
+    ok = cdc_prg_ct_helper:stop_app(cdc_progressor),
+    %% start CDC with invalid brokers
+    %% In this case, CDC will receive wal-log messages but will not be able to relay them to the kafka
+    %% Applied LSN in Postgres will remain unchanged until the message is successfully transmitted to the kafka
+    ok = cdc_prg_ct_helper:start_app(cdc_progressor, ?INVALID_CDC_CONF),
+
+    ID = gen_id(),
+    NsBin = erlang:atom_to_binary(?NS),
+    {ok, ok} = progressor:init(#{ns => ?NS, id => ID, args => <<"init_args">>}),
+    {error, <<"call_error">>} = progressor:call(#{ns => ?NS, id => ID, args => <<"call_args">>}),
+    {ok, ok} = progressor:repair(#{ns => ?NS, id => ID, args => <<"repair_args">>}),
+    %% read Progressors kafka topics
+    {ok,
+        {_, [
+            ?LIFECYCLE_CREATED_MSG(NsBin, ID),
+            ?LIFECYCLE_FAILED_MSG(NsBin, ID),
+            ?LIFECYCLE_WORKING_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC),
+    {ok,
+        {_, [
+            ?EVENT_MSG(NsBin, ID, 1)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC),
+    timer:sleep(3000),
+
+    %% stop CDC with invalid brokers
+    ok = cdc_prg_ct_helper:stop_app(cdc_progressor),
+    %% start CDC
+    ok = cdc_prg_ct_helper:start_app(cdc_progressor),
+
+    %% read CDC kafka topics
+    {ok,
+        {_, [
+            ?LIFECYCLE_CREATED_MSG(NsBin, ID),
+            ?LIFECYCLE_FAILED_MSG(NsBin, ID),
+            ?LIFECYCLE_WORKING_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?CDC_LIFECYCLE_TOPIC),
+    {ok,
+        {_, [
+            ?EVENT_MSG(NsBin, ID, 1)
+        ]}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC),
+    ok.
+
 %% Internal functions
 gen_id() ->
     base64:encode(crypto:strong_rand_bytes(8)).
@@ -320,7 +368,6 @@ mock_processor(simple_success_test = TestCase) ->
             Result = #{
                 events => [event(1), event(2)]
             },
-            %Self ! 1,
             {ok, Result};
         ({call, <<"call_args">>, _Process}, _Opts, _Ctx) ->
             Result = #{
@@ -328,7 +375,6 @@ mock_processor(simple_success_test = TestCase) ->
                 events => [event(3)],
                 action => #{set_timer => erlang:system_time(second)}
             },
-            %Self ! 2,
             {ok, Result};
         ({timeout, <<>>, #{history := History} = _Process}, _Opts, _Ctx) ->
             %% timeout after call processing
@@ -336,34 +382,29 @@ mock_processor(simple_success_test = TestCase) ->
             Result = #{
                 events => [event(4)]
             },
-            %Self ! 3,
             {ok, Result}
     end,
     mock_processor(TestCase, MockProcessor);
 mock_processor(TestCase) when
     TestCase =:= lifecycle_sink_test;
-    TestCase =:= db_connection_lost_test
+    TestCase =:= db_connection_lost_test;
+    TestCase =:= sending_error_test
 ->
-    %Self = self(),
     MockProcessor = fun
         ({init, <<"init_args">>, _Process}, _Opts, _Ctx) ->
             Result = #{
                 events => []
             },
-            %Self ! 1,
             {ok, Result};
         ({call, <<"call_args">>, #{history := []} = _Process}, _Opts, _Ctx) ->
-            %Self ! 2,
             {error, <<"call_error">>};
         ({repair, <<"bad_repair_args">>, #{history := []} = _Process}, _Opts, _Ctx) ->
             %% repair error should not rewrite process detail
-            %Self ! 3,
             {error, <<"repair_error">>};
         ({repair, <<"repair_args">>, #{history := []} = _Process}, _Opts, _Ctx) ->
             Result = #{
                 events => [event(1)]
             },
-            %Self ! 4,
             {ok, Result}
     end,
     mock_processor(TestCase, MockProcessor).
