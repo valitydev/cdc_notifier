@@ -3,17 +3,19 @@
 -include_lib("mg_proto/include/mg_proto_lifecycle_sink_thrift.hrl").
 -include_lib("mg_proto/include/mg_proto_event_sink_thrift.hrl").
 
--export([convert_event/4]).
+-export([convert_lifecycle_event/3]).
+-export([convert_eventsink_event/2]).
+-export([event_key/2]).
 
--type event() ::
+-type lifecycle_event() ::
     init
     | repair
     | remove
-    | {error, Reason :: binary()}
-    | processor_event().
+    | {error, Reason :: binary()}.
 
 -type processor_event() :: #{
     %% #{
+    %%     <<"process_id">> := binary(),
     %%     <<"event_id">> := integer(),
     %%     <<"timestamp">> := calendar:datetime(),
     %%     <<"payload">> := Bytea :: binary(),
@@ -24,22 +26,15 @@
 
 -define(EPOCH_DIFF, 62167219200).
 
--spec convert_event(event(), Namespace :: binary(), ProcessID :: binary(), cdc_progressor:stream_config()) ->
-    {KafkaClient :: atom(), Topic :: binary(), EventKey :: binary(), [cdc_progressor:message_data()]}.
-convert_event(Event, Namespace, ProcessID, #{kafka_client := KafkaClient, lifecycle_topic := LifeCycleTopic}) when
-    Event =:= init;
-    Event =:= repair;
-    Event =:= remove;
-    %% Event = {error, Reason}
-    is_tuple(Event)
-->
-    EventKey = event_key(Namespace, ProcessID),
-    Batch = encode(fun serialize_lifecycle/3, Namespace, ProcessID, [lifecycle_event(Event)]),
-    {KafkaClient, LifeCycleTopic, EventKey, Batch};
-convert_event(Event, Namespace, ProcessID, #{kafka_client := KafkaClient, eventsink_topic := EventSinkTopic}) ->
-    EventKey = event_key(Namespace, ProcessID),
-    Batch = encode(fun serialize_eventsink/3, Namespace, ProcessID, [Event]),
-    {KafkaClient, EventSinkTopic, EventKey, Batch}.
+-spec convert_lifecycle_event(Namespace :: binary(), ProcessID :: binary(), lifecycle_event()) ->
+    [cdc_progressor:message_data()].
+convert_lifecycle_event(Namespace, ProcessID, Event) ->
+    encode(fun serialize_lifecycle/3, Namespace, ProcessID, [lifecycle_event(Event)]).
+
+-spec convert_eventsink_event(Namespace :: binary(), processor_event()) ->
+    [cdc_progressor:message_data()].
+convert_eventsink_event(Namespace, #{<<"process_id">> := ProcessID} = Event) ->
+    encode(fun serialize_eventsink/3, Namespace, ProcessID, [Event]).
 
 %% Internal functions
 

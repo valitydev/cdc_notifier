@@ -235,73 +235,58 @@ parse_repl_data(ReplData, State) ->
         ReplData
     ).
 
-parse_repl_unit({Table, _, _, _} = ReplUnit, #{streams := Streams} = _State) ->
+parse_repl_unit({Table, Action, Row, PrevRow}, #{streams := Streams} = _State) ->
     %% see table naming convention in progressor (prg_pg_migration)
-    [NsBin, Object] = string:split(Table, <<"_">>, trailing),
+    {NsBin, TableType} = string:split(Table, <<"_">>, trailing),
     NsID = binary_to_atom(NsBin),
-    NsStreamConfig = maps:get(NsID, Streams),
-    do_parse_repl_unit(Object, NsBin, ReplUnit, NsStreamConfig).
+    StreamConfig = maps:get(NsID, Streams),
 
-do_parse_repl_unit(
-    <<"processes">>,
-    NsBin,
-    {_Table, insert, #{<<"process_id">> := ProcessID}, _},
-    StreamConfig
-) ->
-    %% init process
-    cdc_prg_converter:convert_event(init, NsBin, ProcessID, StreamConfig);
-do_parse_repl_unit(
-    <<"processes">>,
-    NsBin,
-    {
-        _Table,
-        update,
-        #{
-            <<"process_id">> := ProcessID,
-            <<"status">> := <<"error">>,
-            <<"detail">> := Reason
-        },
-        #{<<"status">> := <<"running">>}
-    },
-    StreamConfig
-) ->
-    %% process error (transition from running to error)
-    cdc_prg_converter:convert_event({error, Reason}, NsBin, ProcessID, StreamConfig);
-do_parse_repl_unit(
-    <<"processes">>,
-    NsBin,
-    {
-        _Table,
-        update,
-        #{
-            <<"process_id">> := ProcessID,
-            <<"status">> := <<"running">>
-        },
-        #{<<"status">> := <<"error">>}
-    },
-    StreamConfig
-) ->
-    %% process repaired (transition from error to running)
-    cdc_prg_converter:convert_event(repair, NsBin, ProcessID, StreamConfig);
-do_parse_repl_unit(
-    <<"processes">>,
-    NsBin,
-    {_Table, delete, #{<<"process_id">> := ProcessID}, _},
-    StreamConfig
-) ->
-    %% process removed
-    cdc_prg_converter:convert_event(remove, NsBin, ProcessID, StreamConfig);
-do_parse_repl_unit(
-    <<"events">>,
-    NsBin,
-    {_Table, insert, #{<<"process_id">> := ProcessID} = Event, _},
-    StreamConfig
-) ->
-    %% new event (events table is used in append-only mode)
-    cdc_prg_converter:convert_event(Event, NsBin, ProcessID, StreamConfig);
-do_parse_repl_unit(_Events, _NsID, {_Table, _, _Row, _} = _ReplUnit, _State) ->
-    %% not lifecycle or event, ignore this message
-    [].
+    case TableType of
+        <<"processes">> ->
+            handle_processes_change(NsBin, Action, Row, PrevRow, StreamConfig);
+        <<"events">> when Action =:= insert ->
+            handle_events_insert(NsBin, Row, StreamConfig);
+        _Other ->
+            [] %% not relevant table
+    end.
+
+handle_processes_change(NsBin, Action, Row, PrevRow, StreamConfig) ->
+    #{kafka_client := KafkaClient, lifecycle_topic := Topic} = StreamConfig,
+    ProcessID = maps:get(<<"process_id">>, Row, <<>>),
+    EventKey = cdc_prg_converter:event_key(NsBin, ProcessID),
+
+    case convert_process_change(NsBin, Action, Row, PrevRow) of
+        [] ->
+            [];
+        Batch ->
+            {KafkaClient, Topic, EventKey, Batch}
+    end.
+
+convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID}, _PrevRow) ->
+    cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
+convert_process_change(NsBin, update, Row, PrevRow) ->
+    #{<<"process_id">> := ProcessID} = Row,
+    CurrentStatus = maps:get(<<"status">>, Row, undefined),
+    PreviousStatus = maps:get(<<"status">>, PrevRow, undefined),
+
+    case {PreviousStatus, CurrentStatus} of
+        {<<"running">>, <<"error">>} ->
+            ErrorReason = maps:get(<<"detail">>, Row, <<"unknown">>),
+            cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, {error, ErrorReason});
+        {<<"error">>, <<"running">>} ->
+            cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, repair);
+        _NoRelevantChange ->
+            []
+    end;
+convert_process_change(NsBin, delete, #{<<"process_id">> := ProcessID}, _PrevRow) ->
+    cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, remove).
+
+handle_events_insert(NsBin, Row, StreamConfig) ->
+    #{kafka_client := KafkaClient, eventsink_topic := Topic} = StreamConfig,
+    ProcessID = maps:get(<<"process_id">>, Row, <<>>),
+    EventKey = cdc_prg_converter:event_key(NsBin, ProcessID),
+    Batch = cdc_prg_converter:convert_eventsink_event(NsBin, Row),
+    {KafkaClient, Topic, EventKey, Batch}.
 
 %% kafka message publishing
 
