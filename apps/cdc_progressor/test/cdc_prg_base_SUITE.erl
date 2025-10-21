@@ -77,14 +77,16 @@ init_per_group(_, C) ->
 end_per_group(_, _) ->
     ok.
 
-init_per_testcase(_, C) ->
+init_per_testcase(TestCase, C) ->
     ok = cdc_prg_ct_helper:create_kafka_topics(),
     timer:sleep(500),
+    _ = mock_processor(TestCase),
     C.
 
 end_per_testcase(_, _) ->
     ok = cdc_prg_ct_helper:delete_kafka_topics(),
     timer:sleep(500),
+    unmock_processor(),
     ok.
 
 all() ->
@@ -103,12 +105,12 @@ groups() ->
 
 -spec simple_success_test(_) -> _.
 simple_success_test(_C) ->
-    _ = mock_processor(simple_success_test),
     ID = gen_id(),
 
     %% start process
     {ok, ok} = progressor:init(#{ns => ?NS, id => ID, args => <<"init_args">>}),
     NsBin = erlang:atom_to_binary(?NS),
+    %% read CDC topics
     {ok,
         {OffsetLC1, [
             ?LIFECYCLE_CREATED_MSG(NsBin, ID)
@@ -118,24 +120,41 @@ simple_success_test(_C) ->
             ?EVENT_MSG(NsBin, ID, 1),
             ?EVENT_MSG(NsBin, ID, 2)
         ]}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC),
+    %% read Progressor topics (should be same)
+    {ok,
+        {OffsetPrgLC1, [
+            ?LIFECYCLE_CREATED_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC),
+    {ok,
+        {OffsetPrgES1, [
+            ?EVENT_MSG(NsBin, ID, 1),
+            ?EVENT_MSG(NsBin, ID, 2)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC),
 
     %% call process
     {ok, <<"response">>} = progressor:call(#{ns => ?NS, id => ID, args => <<"call_args">>}),
+    %% read CDC eventsink topic
     {ok,
         {OffsetES2, [
             ?EVENT_MSG(NsBin, ID, 3),
             ?EVENT_MSG(NsBin, ID, 4)
         ]}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC, OffsetES1),
+    %% read Progressor eventsink topic
+    {ok,
+        {OffsetPrgES2, [
+            ?EVENT_MSG(NsBin, ID, 3),
+            ?EVENT_MSG(NsBin, ID, 4)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC, OffsetPrgES1),
 
     %% check topics
     {ok, {_, []}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC, OffsetES2),
     {ok, {_, []}} = read_kafka_messages(?BROKERS, ?CDC_LIFECYCLE_TOPIC, OffsetLC1),
-    unmock_processor(),
+    {ok, {_, []}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC, OffsetPrgES2),
+    {ok, {_, []}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC, OffsetPrgLC1),
     ok.
 
 -spec lifecycle_sink_test(_) -> _.
 lifecycle_sink_test(_C) ->
-    _ = mock_processor(lifecycle_sink_test),
     ID = gen_id(),
 
     %% start process
@@ -145,6 +164,10 @@ lifecycle_sink_test(_C) ->
         {OffsetLC1, [
             ?LIFECYCLE_CREATED_MSG(NsBin, ID)
         ]}} = read_kafka_messages(?BROKERS, ?CDC_LIFECYCLE_TOPIC),
+    {ok,
+        {OffsetPrgLC1, [
+            ?LIFECYCLE_CREATED_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC),
 
     %% call process with error
     {error, <<"call_error">>} = progressor:call(#{ns => ?NS, id => ID, args => <<"call_args">>}),
@@ -152,12 +175,17 @@ lifecycle_sink_test(_C) ->
         {OffsetLC2, [
             ?LIFECYCLE_FAILED_MSG(NsBin, ID)
         ]}} = read_kafka_messages(?BROKERS, ?CDC_LIFECYCLE_TOPIC, OffsetLC1),
+    {ok,
+        {OffsetPrgLC2, [
+            ?LIFECYCLE_FAILED_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC, OffsetPrgLC1),
 
     %% repair failed (check for duplicates)
     {error, <<"repair_error">>} = progressor:repair(#{
         ns => ?NS, id => ID, args => <<"bad_repair_args">>
     }),
     {ok, {OffsetLC3, []}} = read_kafka_messages(?BROKERS, ?CDC_LIFECYCLE_TOPIC, OffsetLC2),
+    {ok, {OffsetPrgLC3, []}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC, OffsetPrgLC2),
 
     %% repair success
     {ok, ok} = progressor:repair(#{ns => ?NS, id => ID, args => <<"repair_args">>}),
@@ -169,18 +197,26 @@ lifecycle_sink_test(_C) ->
         {OffsetES1, [
             ?EVENT_MSG(NsBin, ID, 1)
         ]}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC),
+    {ok,
+        {OffsetPrgLC4, [
+            ?LIFECYCLE_WORKING_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC, OffsetPrgLC3),
+    {ok,
+        {OffsetPrgES1, [
+            ?EVENT_MSG(NsBin, ID, 1)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC),
 
     %% check topics
     {ok, {_, []}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC, OffsetES1),
     {ok, {_, []}} = read_kafka_messages(?BROKERS, ?CDC_LIFECYCLE_TOPIC, OffsetLC4),
-    unmock_processor(),
+    {ok, {_, []}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC, OffsetPrgES1),
+    {ok, {_, []}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC, OffsetPrgLC4),
     ok.
 
 -spec db_connection_lost_test(_) -> _.
 db_connection_lost_test(_C) ->
     %% stop CDC
     ok = cdc_prg_ct_helper:stop_app(cdc_progressor),
-    _ = mock_processor(lifecycle_sink_test),
     ID = gen_id(),
     NsBin = erlang:atom_to_binary(?NS),
 
@@ -209,7 +245,16 @@ db_connection_lost_test(_C) ->
         {_, [
             ?EVENT_MSG(NsBin, ID, 1)
         ]}} = read_kafka_messages(?BROKERS, ?CDC_EVENTSINK_TOPIC, OffsetLC1),
-    unmock_processor(),
+    {ok,
+        {_, [
+            ?LIFECYCLE_CREATED_MSG(NsBin, ID),
+            ?LIFECYCLE_FAILED_MSG(NsBin, ID),
+            ?LIFECYCLE_WORKING_MSG(NsBin, ID)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_LIFECYCLE_TOPIC),
+    {ok,
+        {_, [
+            ?EVENT_MSG(NsBin, ID, 1)
+        ]}} = read_kafka_messages(?BROKERS, ?PRG_EVENTSINK_TOPIC),
     ok.
 
 %% Internal functions

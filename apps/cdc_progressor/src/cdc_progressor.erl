@@ -1,8 +1,5 @@
 -module(cdc_progressor).
 
--include_lib("mg_proto/include/mg_proto_lifecycle_sink_thrift.hrl").
--include_lib("mg_proto/include/mg_proto_event_sink_thrift.hrl").
-
 -behaviour(gen_server).
 
 %% API
@@ -23,6 +20,9 @@
 -export([handle_replication_data/2]).
 -export([handle_replication_stop/2]).
 
+-export_type([stream_config/0]).
+-export_type([message_data/0]).
+
 -type state() :: #{_ => _}.
 -type namespace_id() :: atom().
 -type stream_config() :: #{
@@ -33,11 +33,14 @@
 -type streams() :: #{
     DataSource :: namespace_id() := DataDestination :: stream_config()
 }.
+-type message_data() :: #{
+    key := binary(),
+    value := EncodedPayload :: binary()
+}.
 
 -define(DEFAULT_RESEND_TIMEOUT, 3000).
 -define(DEFAULT_MAX_RETRIES, 3).
--define(DEFAULT_WAL_RECONNECT_TIMEOUT, 1000).
--define(EPOCH_DIFF, 62167219200).
+-define(DEFAULT_WAL_RECONNECT_TIMEOUT, 5000).
 
 %%%===================================================================
 %%% API
@@ -85,7 +88,6 @@ init([DbOpts, ReplSlot, Streams]) ->
     ),
     ok = epgsql:close(Connection),
     Options = #{slot_type => persistent},
-    %    {ok, Reader} = epg_wal_reader:subscribe({?MODULE, self()}, DbOpts, ReplSlot, Publications, Options),
     {ok, Reader} =
         case epg_wal_reader:subscribe({?MODULE, self()}, DbOpts, ReplSlot, Publications, Options) of
             {ok, _} = OK ->
@@ -220,7 +222,7 @@ construct_table_name(NsId, Postfix) ->
             KafkaClient :: atom(),
             KafkaTopic :: binary(),
             EventKey :: binary(),
-            Batch :: [#{key := binary(), value := EncodedPayload :: binary()}]
+            Batch :: [message_data()]
         }
         | []
     ].
@@ -244,12 +246,10 @@ do_parse_repl_unit(
     <<"processes">>,
     NsBin,
     {_Table, insert, #{<<"process_id">> := ProcessID}, _},
-    #{kafka_client := KafkaClient, lifecycle_topic := LifeCycleTopic}
+    StreamConfig
 ) ->
     %% init process
-    EventKey = event_key(NsBin, ProcessID),
-    Batch = encode(fun serialize_lifecycle/3, NsBin, ProcessID, [lifecycle_event(init)]),
-    {KafkaClient, LifeCycleTopic, EventKey, Batch};
+    cdc_prg_converter:convert_event(init, NsBin, ProcessID, StreamConfig);
 do_parse_repl_unit(
     <<"processes">>,
     NsBin,
@@ -263,12 +263,10 @@ do_parse_repl_unit(
         },
         #{<<"status">> := <<"running">>}
     },
-    #{kafka_client := KafkaClient, lifecycle_topic := LifeCycleTopic}
+    StreamConfig
 ) ->
     %% process error (transition from running to error)
-    EventKey = event_key(NsBin, ProcessID),
-    Batch = encode(fun serialize_lifecycle/3, NsBin, ProcessID, [lifecycle_event({error, Reason})]),
-    {KafkaClient, LifeCycleTopic, EventKey, Batch};
+    cdc_prg_converter:convert_event({error, Reason}, NsBin, ProcessID, StreamConfig);
 do_parse_repl_unit(
     <<"processes">>,
     NsBin,
@@ -281,137 +279,29 @@ do_parse_repl_unit(
         },
         #{<<"status">> := <<"error">>}
     },
-    #{kafka_client := KafkaClient, lifecycle_topic := LifeCycleTopic}
+    StreamConfig
 ) ->
     %% process repaired (transition from error to running)
-    EventKey = event_key(NsBin, ProcessID),
-    Batch = encode(fun serialize_lifecycle/3, NsBin, ProcessID, [lifecycle_event(repair)]),
-    {KafkaClient, LifeCycleTopic, EventKey, Batch};
+    cdc_prg_converter:convert_event(repair, NsBin, ProcessID, StreamConfig);
 do_parse_repl_unit(
     <<"processes">>,
     NsBin,
     {_Table, delete, #{<<"process_id">> := ProcessID}, _},
-    #{kafka_client := KafkaClient, lifecycle_topic := LifeCycleTopic}
+    StreamConfig
 ) ->
     %% process removed
-    EventKey = event_key(NsBin, ProcessID),
-    Batch = encode(fun serialize_lifecycle/3, NsBin, ProcessID, [lifecycle_event(remove)]),
-    {KafkaClient, LifeCycleTopic, EventKey, Batch};
+    cdc_prg_converter:convert_event(remove, NsBin, ProcessID, StreamConfig);
 do_parse_repl_unit(
     <<"events">>,
     NsBin,
     {_Table, insert, #{<<"process_id">> := ProcessID} = Event, _},
-    #{kafka_client := KafkaClient, eventsink_topic := EventSinkTopic}
+    StreamConfig
 ) ->
     %% new event (events table is used in append-only mode)
-    EventKey = event_key(NsBin, ProcessID),
-    Batch = encode(fun serialize_eventsink/3, NsBin, ProcessID, [Event]),
-    {KafkaClient, EventSinkTopic, EventKey, Batch};
+    cdc_prg_converter:convert_event(Event, NsBin, ProcessID, StreamConfig);
 do_parse_repl_unit(_Events, _NsID, {_Table, _, _Row, _} = _ReplUnit, _State) ->
     %% not lifecycle or event, ignore this message
     [].
-
-encode(Encoder, NS, ID, Events) ->
-    [
-        #{
-            key => event_key(NS, ID),
-            value => Encoder(NS, ID, Event)
-        }
-     || Event <- Events
-    ].
-
-event_key(NS, ID) ->
-    <<NS/binary, " ", ID/binary>>.
-
-%% eventsink serialization
-
-serialize_eventsink(SourceNS, SourceID, Event) ->
-    Codec = thrift_strict_binary_codec:new(),
-    #{
-        <<"event_id">> := EventID,
-        <<"timestamp">> := DateTime,
-        <<"payload">> := Payload
-    } = Event,
-    %% decode BYTEA to msgpack
-    Content = erlang:binary_to_term(Payload),
-    Metadata = maps:get(<<"metadata">>, Event, #{}),
-    Timestamp = daytime_to_unixtime(DateTime),
-    Data =
-        {event, #mg_evsink_MachineEvent{
-            source_ns = SourceNS,
-            source_id = SourceID,
-            event_id = EventID,
-            created_at = serialize_timestamp(Timestamp),
-            format_version = maps:get(<<"format_version">>, Metadata, undefined),
-            data = Content
-        }},
-    Type = {struct, union, {mg_proto_event_sink_thrift, 'SinkEvent'}},
-    case thrift_strict_binary_codec:write(Codec, Type, Data) of
-        {ok, NewCodec} ->
-            thrift_strict_binary_codec:close(NewCodec);
-        {error, Reason} ->
-            erlang:error({?MODULE, Reason})
-    end.
-
-daytime_to_unixtime({Date, {Hour, Minute, Second}}) when is_float(Second) ->
-    daytime_to_unixtime({Date, {Hour, Minute, trunc(Second)}});
-daytime_to_unixtime(Daytime) ->
-    to_unixtime(calendar:datetime_to_gregorian_seconds(Daytime)).
-
-to_unixtime(Time) when is_integer(Time) ->
-    Time - ?EPOCH_DIFF.
-
-serialize_timestamp(TimestampSec) ->
-    Str = calendar:system_time_to_rfc3339(TimestampSec, [{unit, second}, {offset, "Z"}]),
-    erlang:list_to_binary(Str).
-
-%% lifecycle serialization
-
-lifecycle_event(init) ->
-    {machine_lifecycle_created, #{occurred_at => erlang:system_time(second)}};
-lifecycle_event(repair) ->
-    {machine_lifecycle_repaired, #{occurred_at => erlang:system_time(second)}};
-lifecycle_event(remove) ->
-    {machine_lifecycle_removed, #{occurred_at => erlang:system_time(second)}};
-lifecycle_event({error, Reason}) ->
-    {machine_lifecycle_failed, #{occurred_at => erlang:system_time(second), reason => Reason}}.
-
-serialize_lifecycle(SourceNS, SourceID, Event) ->
-    Codec = thrift_strict_binary_codec:new(),
-    Data = serialize_lifecycle_event(SourceNS, SourceID, Event),
-    Type = {struct, struct, {mg_proto_lifecycle_sink_thrift, 'LifecycleEvent'}},
-    case thrift_strict_binary_codec:write(Codec, Type, Data) of
-        {ok, NewCodec} ->
-            thrift_strict_binary_codec:close(NewCodec);
-        {error, Reason} ->
-            erlang:error({?MODULE, Reason})
-    end.
-
-serialize_lifecycle_event(SourceNS, SourceID, {_, #{occurred_at := Timestamp}} = Event) ->
-    #mg_lifesink_LifecycleEvent{
-        machine_ns = SourceNS,
-        machine_id = SourceID,
-        created_at = serialize_timestamp(Timestamp),
-        data = serialize_lifecycle_data(Event)
-    }.
-
-serialize_lifecycle_data({machine_lifecycle_created, _}) ->
-    {machine, {created, #mg_lifesink_MachineLifecycleCreatedEvent{}}};
-serialize_lifecycle_data({machine_lifecycle_failed, #{reason := Reason}}) ->
-    {machine,
-        {status_changed, #mg_lifesink_MachineLifecycleStatusChangedEvent{
-            new_status =
-                {failed, #mg_stateproc_MachineStatusFailed{
-                    reason = Reason
-                }}
-        }}};
-serialize_lifecycle_data({machine_lifecycle_repaired, _}) ->
-    {machine,
-        {status_changed, #mg_lifesink_MachineLifecycleStatusChangedEvent{
-            new_status = {working, #mg_stateproc_MachineStatusWorking{}}
-        }}};
-serialize_lifecycle_data({machine_lifecycle_removed, _}) ->
-    {machine, {removed, #mg_lifesink_MachineLifecycleRemovedEvent{}}}.
 
 %% kafka message publishing
 
