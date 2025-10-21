@@ -237,7 +237,7 @@ parse_repl_data(ReplData, State) ->
 
 parse_repl_unit({Table, Action, Row, PrevRow}, #{streams := Streams} = _State) ->
     %% see table naming convention in progressor (prg_pg_migration)
-    {NsBin, TableType} = string:split(Table, <<"_">>, trailing),
+    [NsBin, TableType] = string:split(Table, <<"_">>, trailing),
     NsID = binary_to_atom(NsBin),
     StreamConfig = maps:get(NsID, Streams),
 
@@ -247,7 +247,8 @@ parse_repl_unit({Table, Action, Row, PrevRow}, #{streams := Streams} = _State) -
         <<"events">> when Action =:= insert ->
             handle_events_insert(NsBin, Row, StreamConfig);
         _Other ->
-            [] %% not relevant table
+            %% not relevant table
+            []
     end.
 
 handle_processes_change(NsBin, Action, Row, PrevRow, StreamConfig) ->
