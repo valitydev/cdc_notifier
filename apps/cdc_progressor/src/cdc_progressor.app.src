@@ -1,0 +1,15 @@
+{application, cdc_progressor, [
+    {description, "An OTP application"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {cdc_progressor_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        epg_connector
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, []}
+ ]}.
