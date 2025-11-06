@@ -196,8 +196,6 @@ create_publication_if_not_exists(Connection, NsID) ->
                 "CREATE PUBLICATION " ++ PubNameEscaped ++
                     " FOR TABLE " ++ ProcessesTable ++ " , " ++ EventsTable
             ),
-            %% TODO delete after rework progressor
-            {ok, _, _} = epgsql:equery(Connection, "ALTER TABLE " ++ ProcessesTable ++ " REPLICA IDENTITY FULL"),
             {ok, PubName}
     end.
 
@@ -265,10 +263,10 @@ handle_processes_change(NsBin, Action, Row, PrevRow, StreamConfig) ->
 
 convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID}, _PrevRow) ->
     cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
-convert_process_change(NsBin, update, Row, PrevRow) ->
+convert_process_change(NsBin, update, Row, _PrevRow) ->
     #{<<"process_id">> := ProcessID} = Row,
     CurrentStatus = maps:get(<<"status">>, Row, undefined),
-    PreviousStatus = maps:get(<<"status">>, PrevRow, undefined),
+    PreviousStatus = maps:get(<<"previous_status">>, Row, undefined),
 
     case {PreviousStatus, CurrentStatus} of
         {<<"running">>, <<"error">>} ->
