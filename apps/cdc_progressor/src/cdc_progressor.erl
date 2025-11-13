@@ -196,8 +196,6 @@ create_publication_if_not_exists(Connection, NsID) ->
                 "CREATE PUBLICATION " ++ PubNameEscaped ++
                     " FOR TABLE " ++ ProcessesTable ++ " , " ++ EventsTable
             ),
-            %% TODO delete after rework progressor
-            {ok, _, _} = epgsql:equery(Connection, "ALTER TABLE " ++ ProcessesTable ++ " REPLICA IDENTITY FULL"),
             {ok, PubName}
     end.
 
@@ -235,7 +233,7 @@ parse_repl_data(ReplData, State) ->
         ReplData
     ).
 
-parse_repl_unit({Table, Action, Row, PrevRow}, #{streams := Streams} = _State) ->
+parse_repl_unit({Table, Action, Row, _PrevRow}, #{streams := Streams} = _State) ->
     %% see table naming convention in progressor (prg_pg_migration)
     [NsBin, TableType] = string:split(Table, <<"_">>, trailing),
     NsID = binary_to_atom(NsBin),
@@ -243,7 +241,7 @@ parse_repl_unit({Table, Action, Row, PrevRow}, #{streams := Streams} = _State) -
 
     case TableType of
         <<"processes">> ->
-            handle_processes_change(NsBin, Action, Row, PrevRow, StreamConfig);
+            handle_processes_change(NsBin, Action, Row, StreamConfig);
         <<"events">> when Action =:= insert ->
             handle_events_insert(NsBin, Row, StreamConfig);
         _Other ->
@@ -251,24 +249,24 @@ parse_repl_unit({Table, Action, Row, PrevRow}, #{streams := Streams} = _State) -
             []
     end.
 
-handle_processes_change(NsBin, Action, Row, PrevRow, StreamConfig) ->
+handle_processes_change(NsBin, Action, Row, StreamConfig) ->
     #{kafka_client := KafkaClient, lifecycle_topic := Topic} = StreamConfig,
     ProcessID = maps:get(<<"process_id">>, Row, <<>>),
     EventKey = cdc_prg_converter:event_key(NsBin, ProcessID),
 
-    case convert_process_change(NsBin, Action, Row, PrevRow) of
+    case convert_process_change(NsBin, Action, Row) of
         [] ->
             [];
         Batch ->
             {KafkaClient, Topic, EventKey, Batch}
     end.
 
-convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID}, _PrevRow) ->
+convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID}) ->
     cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
-convert_process_change(NsBin, update, Row, PrevRow) ->
+convert_process_change(NsBin, update, Row) ->
     #{<<"process_id">> := ProcessID} = Row,
     CurrentStatus = maps:get(<<"status">>, Row, undefined),
-    PreviousStatus = maps:get(<<"status">>, PrevRow, undefined),
+    PreviousStatus = maps:get(<<"previous_status">>, Row, undefined),
 
     case {PreviousStatus, CurrentStatus} of
         {<<"running">>, <<"error">>} ->
@@ -279,7 +277,7 @@ convert_process_change(NsBin, update, Row, PrevRow) ->
         _NoRelevantChange ->
             []
     end;
-convert_process_change(NsBin, delete, #{<<"process_id">> := ProcessID}, _PrevRow) ->
+convert_process_change(NsBin, delete, #{<<"process_id">> := ProcessID}) ->
     cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, remove).
 
 handle_events_insert(NsBin, Row, StreamConfig) ->
