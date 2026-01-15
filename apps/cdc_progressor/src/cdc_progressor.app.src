@@ -6,6 +6,7 @@
     {applications, [
         kernel,
         stdlib,
+        jsx,
         epg_connector
     ]},
     {env, []},
