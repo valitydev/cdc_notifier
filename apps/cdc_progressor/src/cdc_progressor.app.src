@@ -10,7 +10,8 @@
         mg_proto,
         jsx,
         prometheus,
-        epg_connector
+        epg_connector,
+        brod
     ]},
     {env, []},
     {modules, []},
