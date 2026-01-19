@@ -6,6 +6,7 @@
     {applications, [
         kernel,
         stdlib,
+        thrift,
         jsx,
         prometheus,
         epg_connector
