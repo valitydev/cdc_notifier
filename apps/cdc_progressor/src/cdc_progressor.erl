@@ -269,14 +269,20 @@ handle_processes_change(NsBin, Action, Row, StreamConfig) ->
             {KafkaClient, Topic, EventKey, Batch}
     end.
 
-convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID}) ->
+convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID, <<"status">> := <<"running">>}) ->
+    %% old progressor db schema (ver. before 20260121)
     cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
+convert_process_change(_NsBin, insert, #{<<"status">> := <<"init">>}) ->
+    %% current progressor db schema (ver. after 20260121), ignore this message
+    [];
 convert_process_change(NsBin, update, Row) ->
     #{<<"process_id">> := ProcessID} = Row,
     CurrentStatus = maps:get(<<"status">>, Row, undefined),
     PreviousStatus = maps:get(<<"previous_status">>, Row, undefined),
 
     case {PreviousStatus, CurrentStatus} of
+        {<<"init">>, <<"running">>} ->
+            cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
         {<<"running">>, <<"error">>} ->
             ErrorReason = maps:get(<<"detail">>, Row, <<"unknown">>),
             cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, {error, ErrorReason});
