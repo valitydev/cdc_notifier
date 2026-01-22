@@ -81,6 +81,7 @@ init([DbOpts, ReplSlot, Streams]) ->
     Publications = lists:foldl(
         fun(NsID, Acc) ->
             {ok, PubName} = create_publication_if_not_exists(Connection, NsID),
+            _ = create_metrics(),
             [PubName | Acc]
         end,
         [],
@@ -95,6 +96,7 @@ init([DbOpts, ReplSlot, Streams]) ->
             {error, {already_started, Pid}} ->
                 {ok, Pid}
         end,
+    logger:info("replication started for slot ~p with publications ~p", [ReplSlot, Publications]),
     MonitorRef = erlang:monitor(process, Reader),
     {ok, #{
         db_opts => DbOpts,
@@ -117,10 +119,12 @@ handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 -spec handle_cast(term(), state()) -> {noreply, state()}.
-handle_cast({handle_replication_stop, _ReplSlot}, #{wal_reader := undefined} = State) ->
+handle_cast({handle_replication_stop, ReplSlot}, #{wal_reader := undefined} = State) ->
     %% already handled via monitor
+    logger:warning("handle replication stop for already stopped slot ~p", [ReplSlot]),
     {noreply, State};
-handle_cast({handle_replication_stop, _ReplSlot}, #{wal_reader := ReaderPid} = State) when is_pid(ReaderPid) ->
+handle_cast({handle_replication_stop, ReplSlot}, #{wal_reader := ReaderPid} = State) when is_pid(ReaderPid) ->
+    logger:info("handle replication stop for slot ~p", [ReplSlot]),
     ReconnectTimeout = application:get_env(cdc_progressor, reconnect_timeout, ?DEFAULT_WAL_RECONNECT_TIMEOUT),
     erlang:start_timer(ReconnectTimeout, self(), restart_replication),
     {noreply, State#{monitor => undefined, wal_reader => undefined}};
@@ -130,9 +134,10 @@ handle_cast(_Msg, State) ->
 -spec handle_info(term(), state()) -> {noreply, state()}.
 handle_info(
     {'DOWN', MonitorRef, _Type, ReaderPid, _Info},
-    #{monitor := MonitorRef, wal_reader := ReaderPid} = State
+    #{monitor := MonitorRef, wal_reader := ReaderPid, repl_slot := ReplSlot} = State
 ) ->
     %% wal reader crashed (unexpected down)
+    logger:error("handle replication down for slot ~p", [ReplSlot]),
     ReconnectTimeout = application:get_env(cdc_progressor, reconnect_timeout, ?DEFAULT_WAL_RECONNECT_TIMEOUT),
     erlang:start_timer(ReconnectTimeout, self(), restart_replication),
     {noreply, State#{monitor => undefined, wal_reader => undefined}};
@@ -145,6 +150,7 @@ handle_info({timeout, _TRef, restart_replication}, State) ->
     Options = #{slot_type => persistent},
     maybe
         {ok, Reader} ?= epg_wal_reader:subscribe({?MODULE, self()}, DbOpts, ReplSlot, Publications, Options),
+        logger:info("replication started for slot ~p with publications ~p", [ReplSlot, Publications]),
         MonitorRef = erlang:monitor(process, Reader),
         NewState = State#{
             wal_reader => Reader,
@@ -153,7 +159,7 @@ handle_info({timeout, _TRef, restart_replication}, State) ->
         {noreply, NewState}
     else
         Error ->
-            logger:error("Can`t restart replication with error: ~p", [Error]),
+            logger:error("Can`t restart replication for slot ~p with error: ~p", [ReplSlot, Error]),
             ReconnectTimeout = application:get_env(cdc_progressor, reconnect_timeout, ?DEFAULT_WAL_RECONNECT_TIMEOUT),
             erlang:start_timer(ReconnectTimeout, self(), restart_replication),
             {noreply, State}
@@ -189,6 +195,7 @@ create_publication_if_not_exists(Connection, NsID) ->
     ),
     case IsPublicationExists of
         true ->
+            logger:info("publication ~p for tables ~p already exists", [PubName, [ProcessesTable, EventsTable]]),
             {ok, PubName};
         false ->
             {ok, _, _} = epgsql:equery(
@@ -196,6 +203,7 @@ create_publication_if_not_exists(Connection, NsID) ->
                 "CREATE PUBLICATION " ++ PubNameEscaped ++
                     " FOR TABLE " ++ ProcessesTable ++ " , " ++ EventsTable
             ),
+            logger:info("publication ~p for tables ~p created", [PubName, [ProcessesTable, EventsTable]]),
             {ok, PubName}
     end.
 
@@ -261,14 +269,20 @@ handle_processes_change(NsBin, Action, Row, StreamConfig) ->
             {KafkaClient, Topic, EventKey, Batch}
     end.
 
-convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID}) ->
+convert_process_change(NsBin, insert, #{<<"process_id">> := ProcessID, <<"status">> := <<"running">>}) ->
+    %% old progressor db schema (ver. before 20260121)
     cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
+convert_process_change(_NsBin, insert, #{<<"status">> := <<"init">>}) ->
+    %% current progressor db schema (ver. after 20260121), ignore this message
+    [];
 convert_process_change(NsBin, update, Row) ->
     #{<<"process_id">> := ProcessID} = Row,
     CurrentStatus = maps:get(<<"status">>, Row, undefined),
     PreviousStatus = maps:get(<<"previous_status">>, Row, undefined),
 
     case {PreviousStatus, CurrentStatus} of
+        {<<"init">>, <<"running">>} ->
+            cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, init);
         {<<"running">>, <<"error">>} ->
             ErrorReason = maps:get(<<"detail">>, Row, <<"unknown">>),
             cdc_prg_converter:convert_lifecycle_event(NsBin, ProcessID, {error, ErrorReason});
@@ -303,12 +317,15 @@ send_with_retry(_Data, _ResendTimeout, MaxRetries, RetryCount) when RetryCount >
 send_with_retry([{KafkaClient, Topic, EventKey, Batch} | Rest] = Data, ResendTimeout, MaxRetries, RetryCount) ->
     try produce(KafkaClient, Topic, EventKey, Batch) of
         ok ->
+            _ = prometheus_counter:inc(cdc_progressor_kafka_produce_success_count, [Topic]),
             send_with_retry(Rest, ResendTimeout, MaxRetries, 0);
         {error, Reason} ->
+            _ = prometheus_counter:inc(cdc_progressor_kafka_produce_failed_count, [Topic]),
             logger:error("kafka client produce error: ~p", [Reason]),
             send_with_retry(Data, ResendTimeout, MaxRetries, RetryCount + 1)
     catch
         Class:Reason:Stacktrace ->
+            _ = prometheus_counter:inc(cdc_progressor_kafka_produce_failed_count, [Topic]),
             logger:error("kafka client produce exception: ~p", [[Class, Reason, Stacktrace]]),
             send_with_retry(Data, ResendTimeout, MaxRetries, RetryCount + 1)
     end.
@@ -329,3 +346,18 @@ produce(Client, Topic, PartitionKey, Batch) ->
 
 partition(PartitionsCount, Key) ->
     erlang:phash2(Key) rem PartitionsCount.
+
+%% monitoring
+
+create_metrics() ->
+    _ = prometheus_counter:declare([
+        {name, cdc_progressor_kafka_produce_success_count},
+        {help, "Count of successful publications into kafka topic"},
+        {labels, [kafka_topic]}
+    ]),
+
+    _ = prometheus_counter:declare([
+        {name, cdc_progressor_kafka_produce_failed_count},
+        {help, "Count of failed publications into kafka topic"},
+        {labels, [kafka_topic]}
+    ]).

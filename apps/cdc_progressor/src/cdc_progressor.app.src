@@ -6,7 +6,12 @@
     {applications, [
         kernel,
         stdlib,
-        epg_connector
+        thrift,
+        mg_proto,
+        jsx,
+        prometheus,
+        epg_connector,
+        brod
     ]},
     {env, []},
     {modules, []},
