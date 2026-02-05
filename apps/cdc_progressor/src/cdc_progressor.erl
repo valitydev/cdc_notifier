@@ -317,6 +317,7 @@ send_with_retry(_Data, _ResendTimeout, MaxRetries, RetryCount) when RetryCount >
 send_with_retry([{KafkaClient, Topic, EventKey, Batch} | Rest] = Data, ResendTimeout, MaxRetries, RetryCount) ->
     try produce(KafkaClient, Topic, EventKey, Batch) of
         ok ->
+            logger:info("produce message, topic: ~p, key: ~p", [Topic, EventKey]),
             _ = prometheus_counter:inc(cdc_progressor_kafka_produce_success_count, [Topic]),
             send_with_retry(Rest, ResendTimeout, MaxRetries, 0);
         {error, Reason} ->
