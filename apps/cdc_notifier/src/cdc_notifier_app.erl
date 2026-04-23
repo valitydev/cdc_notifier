@@ -23,7 +23,7 @@ start_listener() ->
     Port = application:get_env(cdc_notifier, port, 8022),
     Routes = cowboy_router:compile([
         {'_', [
-          {"/metrics/[:registry]", prometheus_cowboy2_handler, []}
+            {"/metrics/[:registry]", prometheus_cowboy2_handler, []}
         ]}
     ]),
     {ok, _} = cowboy:start_clear(http_listener, [{port, Port}], #{env => #{dispatch => Routes}}).
