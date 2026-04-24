@@ -5,7 +5,10 @@
     {mod, {cdc_notifier_app, []}},
     {applications, [
         kernel,
-        stdlib
+        stdlib,
+        cowboy,
+        prometheus,
+        prometheus_cowboy
     ]},
     {env, []},
     {modules, []},
