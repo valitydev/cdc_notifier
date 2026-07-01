@@ -41,13 +41,7 @@
 ]).
 -define(DEFAULT_EPG_CONF, [
     {databases, #{
-        ?EPG_DB_REF => #{
-            host => "postgres",
-            port => 5432,
-            database => "progressor_db",
-            username => "progressor",
-            password => "progressor"
-        }
+        ?EPG_DB_REF => ?DEFAULT_DB_OPTS
     }},
     {pools, #{
         ?EPG_POOL => #{
@@ -56,6 +50,13 @@
         }
     }}
 ]).
+-define(DEFAULT_DB_OPTS, #{
+    host => "postgres",
+    port => 5432,
+    database => "progressor_db",
+    username => "progressor",
+    password => "progressor"
+}).
 
 -define(DEFAULT_PRG_CONF, [
     {namespaces, #{
