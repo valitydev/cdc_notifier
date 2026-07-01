@@ -63,10 +63,12 @@
 ).
 
 init_per_suite(Config) ->
-    %% must be before cdc_progressor started (before replication started)
-    ok = cdc_prg_ct_helper:create_publication(),
-    Apps = [brod, epg_connector, progressor, cdc_progressor],
+    Apps = [brod, epg_connector, progressor],
     lists:foreach(fun(Application) -> ok = cdc_prg_ct_helper:start_app(Application) end, Apps),
+    %% must be before cdc_progressor started (before replication started)
+    %% but after progressor (after progressor migrations)
+    ok = cdc_prg_ct_helper:create_publication(),
+    ok = cdc_prg_ct_helper:start_app(cdc_progressor),
     Config.
 
 end_per_suite(_Config) ->
