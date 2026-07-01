@@ -7,6 +7,10 @@
 -export([stop_app/1]).
 -export([create_kafka_topics/0]).
 -export([delete_kafka_topics/0]).
+-export([create_publication/0]).
+-export([create_publication/2]).
+-export([delete_publication/0]).
+-export([delete_publication/2]).
 
 -define(TOPIC_CONFIG(Topic), #{
     configs => [],
@@ -79,6 +83,65 @@ delete_kafka_topics() ->
 -spec delete_kafka_topics([Topic :: binary()]) -> ok | no_return().
 delete_kafka_topics(Topics) ->
     ok = brod:delete_topics(?BROKERS, Topics, 5000).
+
+-spec create_publication() -> ok.
+create_publication() ->
+    {ok, Connection} = epgsql:connect(?DEFAULT_DB_OPTS),
+    ok = create_publication(Connection, ?NAMESPACE),
+    ok = epgsql:close(Connection),
+    ok.
+
+-spec create_publication(pid(), atom()) -> ok.
+create_publication(Connection, NsID) ->
+    PubName = erlang:atom_to_list(NsID),
+    PubNameEscaped = "\"" ++ PubName ++ "\"",
+    #{
+        processes := ProcessesTable,
+        events := EventsTable
+    } = cdc_prg_utils:tables(NsID),
+    {ok, _, [{IsPublicationExists}]} = epgsql:equery(
+        Connection,
+        "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+        [PubName]
+    ),
+    case IsPublicationExists of
+        true ->
+            ok;
+        false ->
+            {ok, _, _} = epgsql:equery(
+                Connection,
+                "CREATE PUBLICATION " ++ PubNameEscaped ++
+                    " FOR TABLE " ++ ProcessesTable ++ " , " ++ EventsTable
+            ),
+            ok
+    end.
+
+-spec delete_publication() -> ok.
+delete_publication() ->
+    {ok, Connection} = epgsql:connect(?DEFAULT_DB_OPTS),
+    ok = delete_publication(Connection, ?NAMESPACE),
+    ok = epgsql:close(Connection),
+    ok.
+
+-spec delete_publication(pid(), atom()) -> ok.
+delete_publication(Connection, NsID) ->
+    PubName = erlang:atom_to_list(NsID),
+    PubNameEscaped = "\"" ++ PubName ++ "\"",
+    {ok, _, [{IsPublicationExists}]} = epgsql:equery(
+        Connection,
+        "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+        [PubName]
+    ),
+    case IsPublicationExists of
+        true ->
+            {ok, _, _} = epgsql:equery(
+                Connection,
+                "DROP PUBLICATION " ++ PubNameEscaped
+            ),
+            ok;
+        false ->
+            ok
+    end.
 
 %% Internal functions
 load_app(AppName) ->

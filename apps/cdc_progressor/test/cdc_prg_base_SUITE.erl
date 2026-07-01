@@ -63,13 +63,19 @@
 ).
 
 init_per_suite(Config) ->
-    Apps = [brod, epg_connector, progressor, cdc_progressor],
+    Apps = [brod, epg_connector, progressor],
     lists:foreach(fun(Application) -> ok = cdc_prg_ct_helper:start_app(Application) end, Apps),
+    %% must be before cdc_progressor started (before replication started)
+    %% but after progressor (after progressor migrations)
+    ok = cdc_prg_ct_helper:create_publication(),
+    ok = cdc_prg_ct_helper:start_app(cdc_progressor),
     Config.
 
 end_per_suite(_Config) ->
     Apps = lists:reverse([brod, epg_connector, progressor, cdc_progressor]),
     lists:foreach(fun(Application) -> ok = cdc_prg_ct_helper:stop_app(Application) end, Apps),
+    %% must be after cdc_progressor stopped (after replication stoped)
+    ok = cdc_prg_ct_helper:delete_publication(),
     ok.
 
 init_per_group(_, C) ->
@@ -312,7 +318,7 @@ gen_id() ->
 event(Id) ->
     #{
         event_id => Id,
-        timestamp => erlang:system_time(second),
+        timestamp => erlang:system_time(microsecond),
         metadata => #{<<"format_version">> => 1},
         %% msg_pack compatibility for mg_proto
         payload => erlang:term_to_binary({bin, <<Id>>})
@@ -373,7 +379,7 @@ mock_processor(simple_success_test = TestCase) ->
             Result = #{
                 response => <<"response">>,
                 events => [event(3)],
-                action => #{set_timer => erlang:system_time(second)}
+                action => timeout
             },
             {ok, Result};
         ({timeout, <<>>, #{history := History} = _Process}, _Opts, _Ctx) ->

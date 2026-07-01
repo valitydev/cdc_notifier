@@ -76,13 +76,19 @@ handle_replication_stop(Pid, ReplStop) ->
 
 -spec init([any()]) -> {ok, state()}.
 init([DbOpts, ReplSlot, Streams]) ->
+    _ = create_metrics(),
     NsIDs = maps:keys(Streams),
     {ok, Connection} = epgsql:connect(DbOpts),
     Publications = lists:foldl(
         fun(NsID, Acc) ->
-            {ok, PubName} = create_publication_if_not_exists(Connection, NsID),
-            _ = create_metrics(),
-            [PubName | Acc]
+            PubName = erlang:atom_to_list(NsID),
+            case is_publication_exists(Connection, PubName) of
+                true ->
+                    [PubName | Acc];
+                false ->
+                    logger:warning("unknown publication: ~p", [PubName]),
+                    Acc
+            end
         end,
         [],
         NsIDs
@@ -181,43 +187,13 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-create_publication_if_not_exists(Connection, NsID) ->
-    PubName = erlang:atom_to_list(NsID),
-    PubNameEscaped = "\"" ++ PubName ++ "\"",
-    #{
-        processes := ProcessesTable,
-        events := EventsTable
-    } = tables(NsID),
+is_publication_exists(Connection, PubName) ->
     {ok, _, [{IsPublicationExists}]} = epgsql:equery(
         Connection,
         "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
         [PubName]
     ),
-    case IsPublicationExists of
-        true ->
-            logger:info("publication ~p for tables ~p already exists", [PubName, [ProcessesTable, EventsTable]]),
-            {ok, PubName};
-        false ->
-            {ok, _, _} = epgsql:equery(
-                Connection,
-                "CREATE PUBLICATION " ++ PubNameEscaped ++
-                    " FOR TABLE " ++ ProcessesTable ++ " , " ++ EventsTable
-            ),
-            logger:info("publication ~p for tables ~p created", [PubName, [ProcessesTable, EventsTable]]),
-            {ok, PubName}
-    end.
-
-tables(NsId) ->
-    #{
-        processes => construct_table_name(NsId, "_processes"),
-        tasks => construct_table_name(NsId, "_tasks"),
-        schedule => construct_table_name(NsId, "_schedule"),
-        running => construct_table_name(NsId, "_running"),
-        events => construct_table_name(NsId, "_events")
-    }.
-
-construct_table_name(NsId, Postfix) ->
-    "\"" ++ erlang:atom_to_list(NsId) ++ Postfix ++ "\"".
+    IsPublicationExists.
 
 -spec parse_repl_data(
     [{Table :: binary(), Op :: insert | update | delete, Row :: map(), PrevRow :: map()}],
